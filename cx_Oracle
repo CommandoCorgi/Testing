@@ -1,0 +1,130 @@
+import pandas as pd
+from sqlalchemy import types, create_engine
+from datetime import datetime
+from datetime import date
+from datetime import timedelta
+import cx_Oracle
+import os, time
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email import encoders
+import sqlalchemy as sa
+from inspect import currentframe, getframeinfo
+from traceback import format_tb
+
+cx_Oracle_data_type_mapping = {
+    cx_Oracle.DB_TYPE_BFILE: lambda x: str(x),
+    cx_Oracle.DB_TYPE_BINARY_DOUBLE: lambda x: str(x),
+    cx_Oracle.DB_TYPE_BINARY_FLOAT: lambda x: str(x),
+    cx_Oracle.DB_TYPE_BLOB: lambda x: str(x),
+    cx_Oracle.DB_TYPE_CHAR: lambda x: "'" + str(x) + "'",
+    cx_Oracle.DB_TYPE_CLOB: lambda x: str(x),
+    cx_Oracle.DB_TYPE_CURSOR: lambda x: str(x),
+    cx_Oracle.DB_TYPE_DATE: lambda x: "to_Date('" + str(x) + "','YYYY-MM-DD HH24:MI:SS')",
+    cx_Oracle.DB_TYPE_INTERVAL_DS: lambda x: str(x),
+    cx_Oracle.DB_TYPE_JSON: lambda x: str(x),
+    cx_Oracle.DB_TYPE_LONG: lambda x: str(x),
+    cx_Oracle.DB_TYPE_LONG_RAW: lambda x: str(x),
+    cx_Oracle.DB_TYPE_NCHAR: lambda x: "'" + str(x) + "'",
+    cx_Oracle.DB_TYPE_NCLOB: lambda x: str(x),
+    cx_Oracle.DB_TYPE_NUMBER: lambda x: str(x),
+    cx_Oracle.DB_TYPE_NVARCHAR: lambda x: "'" + str(x) + "'",
+    cx_Oracle.DB_TYPE_OBJECT: lambda x: str(x),
+    cx_Oracle.DB_TYPE_RAW: lambda x: str(x),
+    cx_Oracle.DB_TYPE_ROWID: lambda x: str(x),
+    cx_Oracle.DB_TYPE_TIMESTAMP: lambda x: str(x),
+    cx_Oracle.DB_TYPE_TIMESTAMP_LTZ: lambda x: str(x),
+    cx_Oracle.DB_TYPE_TIMESTAMP_TZ: lambda x: str(x),
+    cx_Oracle.DB_TYPE_VARCHAR: lambda x: "'" + str(x) + "'"
+}
+
+table_name = 'RDM_MRG_IMPAIRMENT_NEW'
+
+first_day_of_last_month = (date.today().replace(day=1) - timedelta(days=1)).replace(day=1)
+path = 'Test.xls'
+
+
+
+key_columns = ['AS_OF_DATE', 'CLIENT_CODE', 'CLIENT_NAME', 'EFFECTIVE_DATE', 'CCY_CDE']
+value_columns = ['LEDGER_BALANCE', 'INTEREST_CONTRA', 'NET_BALANCE']
+
+as_of_today = pd.read_excel(path)
+as_of_today_dict = as_of_today.set_index(key_columns).T.to_dict('list')
+
+try:
+    cx_Oracle.init_oracle_client(
+        lib_dir=r"C:\Library\Oracle Instant Client for Python\instantclient-basic-windows.x64-18.5.0.0.0dbru\instantclient_18_5")
+    dsn_tns = cx_Oracle.makedsn(hostname, port, service_name=service_name)
+    conn = cx_Oracle.connect(user=username, password=password, dsn=dsn_tns)
+    c = conn.cursor()
+
+    # Get column description
+    sql = """
+        select * from {table} 
+           where 1=0
+          """.format(table=table_name)
+    c.execute(sql)
+
+    sql_conversion_mapping = {}
+    for column in c.description:
+        sql_conversion_mapping.update({column[0]: cx_Oracle_data_type_mapping[column[1]]})
+
+    sql = """
+        select * from {table} 
+           where as_of_date = to_date({insert_date},'YYYYMMDD')
+          """.format(table=table_name, insert_date=first_day_of_last_month.strftime('%Y%m%d'))
+
+    old_data = pd.read_sql(sql, conn)
+    old_data_dict = old_data.set_index(key_columns).T.to_dict('list')
+
+    update_count = 0
+    identical_count = 0
+    insert_count = 0
+
+    # Check if file data exists in database
+    for k in list(as_of_today_dict):
+        z_key = zip(key_columns, list(k))
+        z_value = zip(value_columns, list(as_of_today_dict.get(k)))
+        # if file data exists in database
+        if k in old_data_dict:
+            # if values are identical
+            if old_data_dict.get(k) == as_of_today_dict.get(k):
+                identical_count = identical_count + 1
+            # if values are not identical
+            else:
+                sql = 'UPDATE ' + table_name + ' SET ' + \
+                      ', '.join('{}={}'.format(k, sql_conversion_mapping.get(k)(v)) for k, v in
+                                z_value) + \
+                      ' WHERE 1=1 AND ' + \
+                      ' AND '.join(
+                          '{}={}'.format(k, sql_conversion_mapping.get(k)(v)) for k, v in z_key)
+                c.execute(sql)
+                update_count = update_count + 1
+
+            del as_of_today_dict[k]
+
+    # for the remaining data, insert into database
+    for k in list(as_of_today_dict):
+        z_key_value = zip(key_columns + value_columns, list(k) + list(as_of_today_dict.get(k)))
+        sql = "INSERT INTO " + \
+              table_name + \
+              " " + "(" + ",".join(k for k in key_columns + value_columns) + \
+              ") VALUES (" + \
+              ", ".join('{}'.format(sql_conversion_mapping.get(k)(v)) for k, v in z_key_value) + ")"
+        insert_count = insert_count + 1
+        c.execute(sql)
+
+    conn.commit()
+
+    print(str(update_count) + ' record(s) updated.')
+    print(str(identical_count) + ' identical record(s) exist(s).')
+    print(str(insert_count) + ' record(s) inserted.')
+
+except Exception as e:
+    print(e)
+    conn.rollback()
+finally:
+    conn.close()
